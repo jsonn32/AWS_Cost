@@ -42,6 +42,7 @@ Options:
 ```
 --profile NAME    AWS profile to use (default: the standard credential chain)
 --months N        Months of history, 1 to 12 (default: 12)
+--regions LIST    Comma-separated regions instead of every enabled one
 --output FILE     Output path (default: aws-backup-costs-YYYY-MM-DD.xlsx)
 --assume-role R   Gather the inventory from every org account by assuming
                   role R in each (case-sensitive)
@@ -62,8 +63,37 @@ so a run costs a few cents. Everything else the script calls is free.
 
 ### How long it takes
 
-It scans every region your account has enabled, so a few minutes on a large
-estate is normal. Progress is printed as it goes.
+It scans every region your account has enabled, 12 at a time, printing what it
+finds per account as it goes. A single account is usually well under a minute;
+a large organization takes longer.
+
+To cut it short, limit the regions:
+
+```bash
+python aws_backup_cost_report.py --regions us-east-1,us-west-2,eu-west-1
+```
+
+Anything outside that list is then missing from the report, and the Notes sheet
+says so.
+
+## Running it in AWS CloudShell
+
+The easiest path, and the one to give customers: no Python install, no access
+keys, and credentials are already present.
+
+Open **CloudShell** from the AWS console toolbar, upload the script with
+**Actions → Upload file**, then:
+
+```bash
+pip3 install openpyxl
+python3 aws_backup_cost_report.py
+```
+
+Retrieve the workbook with **Actions → Download file** and the filename the
+script printed.
+
+Note it is `pip3 install`, without `--user` — CloudShell already runs inside a
+virtualenv and rejects a user install. boto3 is preinstalled.
 
 ## Running across an AWS Organization
 

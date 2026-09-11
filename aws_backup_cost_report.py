@@ -27,7 +27,9 @@ import datetime as dt
 import os
 import re
 import sys
+import threading
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 try:
@@ -155,7 +157,18 @@ MAX_SNAPSHOT_PAGES = 20
 
 
 GIB = 1024 ** 3
-BOTO_CONFIG = Config(retries={"max_attempts": 5, "mode": "standard"})
+# Explicit timeouts: without them a single unreachable regional endpoint
+# can stall the whole run behind the default socket timeout.
+BOTO_CONFIG = Config(retries={"max_attempts": 3, "mode": "standard"},
+                     connect_timeout=10, read_timeout=30)
+
+# Regions are scanned concurrently. A serial pass over ~17 enabled regions
+# for five services is minutes of almost pure network latency, and the
+# calls are independent.
+REGION_WORKERS = 12
+
+# botocore clients are safe to CALL across threads but not to CREATE.
+_CLIENT_LOCK = threading.Lock()
 
 # Collected as the run proceeds and printed on the Notes sheet.
 NOTES: List[Tuple[str, str]] = []
@@ -560,12 +573,50 @@ def enabled_regions(session: Any) -> List[str]:
     return [fallback]
 
 
+def make_client(session: Any, service: str, region: str) -> Any:
+    """Create a boto3 client under a lock.
+
+    botocore clients are safe to CALL from multiple threads, but CREATING one
+    is not thread-safe — concurrent creation from a shared Session can race on
+    the loader cache. Every scanner below fans out across regions, so every
+    client is built through here.
+    """
+    with _CLIENT_LOCK:
+        return session.client(service, region_name=region, config=BOTO_CONFIG)
+
+
+def map_regions(fn: Any, regions: Sequence[str],
+                label: str = "") -> List[Dict[str, Any]]:
+    """Run a per-region scanner across all regions concurrently.
+
+    A serial loop over ~17 enabled regions for five services is minutes of
+    almost pure network latency. These calls are independent, so they fan out.
+    Failures are already swallowed inside each scanner; anything that escapes
+    is recorded rather than allowed to kill the run.
+    """
+    rows: List[Dict[str, Any]] = []
+    if not regions:
+        return rows
+    workers = min(REGION_WORKERS, len(regions))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(fn, region): region for region in regions}
+        for future in as_completed(futures):
+            region = futures[future]
+            try:
+                rows.extend(future.result() or [])
+            except Exception as err:  # noqa: BLE001
+                note(label or "Scan",
+                     "%s: skipped (%s)." % (region, err.__class__.__name__))
+    return rows
+
+
 def scan_vaults(session: Any, regions: Sequence[str]) -> List[Dict[str, Any]]:
     """AWS Backup vaults with recovery-point counts, size by tier, and age."""
-    rows: List[Dict[str, Any]] = []
-    for region in regions:
+
+    def one_region(region: str) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
         try:
-            client = session.client("backup", region_name=region, config=BOTO_CONFIG)
+            client = make_client(session, "backup", region)
             vaults: List[Dict[str, Any]] = []
             token = None
             while True:
@@ -577,8 +628,8 @@ def scan_vaults(session: Any, regions: Sequence[str]) -> List[Dict[str, Any]]:
                     break
         except Exception as err:  # noqa: BLE001
             note("AWS Backup",
-                 f"{region}: vault listing skipped ({err.__class__.__name__}).")
-            continue
+                 "%s: vault listing skipped (%s)." % (region, err.__class__.__name__))
+            return rows
 
         for vault in vaults:
             name = vault.get("BackupVaultName", "")
@@ -598,10 +649,7 @@ def scan_vaults(session: Any, regions: Sequence[str]) -> List[Dict[str, Any]]:
                 token = None
                 pages = 0
                 while pages < MAX_RECOVERY_POINT_PAGES:
-                    kwargs: Dict[str, Any] = {
-                        "BackupVaultName": name,
-                        "MaxResults": 1000,
-                    }
+                    kwargs = {"BackupVaultName": name, "MaxResults": 1000}
                     if token:
                         kwargs["NextToken"] = token
                     resp = client.list_recovery_points_by_backup_vault(**kwargs)
@@ -625,29 +673,32 @@ def scan_vaults(session: Any, regions: Sequence[str]) -> List[Dict[str, Any]]:
                 if token:
                     row["truncated"] = "yes"
                     note("AWS Backup",
-                         f"{region}/{name}: stopped at {MAX_RECOVERY_POINT_PAGES} "
-                         "pages of recovery points; sizes for this vault are a "
-                         "lower bound.")
+                         "%s/%s: stopped at %d pages of recovery points; sizes "
+                         "for this vault are a lower bound."
+                         % (region, name, MAX_RECOVERY_POINT_PAGES))
             except Exception as err:  # noqa: BLE001
                 note("AWS Backup",
-                     f"{region}/{name}: recovery points unreadable "
-                     f"({err.__class__.__name__}); size left blank.")
+                     "%s/%s: recovery points unreadable (%s); size left blank."
+                     % (region, name, err.__class__.__name__))
             row["warm_gib"] = round(row["warm_gib"], 3)
             row["cold_gib"] = round(row["cold_gib"], 3)
             row["total_gib"] = round(row["warm_gib"] + row["cold_gib"], 3)
             rows.append(row)
-    return rows
+        return rows
+
+    return map_regions(one_region, regions, "AWS Backup")
 
 
 def scan_ebs_snapshots(session: Any, regions: Sequence[str],
                        now: dt.datetime) -> List[Dict[str, Any]]:
     """Every self-owned EBS snapshot, with age and whether its volume survives."""
-    rows: List[Dict[str, Any]] = []
-    for region in regions:
+
+    def one_region(region: str) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
         try:
-            ec2 = session.client("ec2", region_name=region, config=BOTO_CONFIG)
+            ec2 = make_client(session, "ec2", region)
         except Exception:  # noqa: BLE001
-            continue
+            return rows
 
         live_volumes = set()
         try:
@@ -664,8 +715,8 @@ def scan_ebs_snapshots(session: Any, regions: Sequence[str],
                     break
         except Exception as err:  # noqa: BLE001
             note("EBS",
-                 f"{region}: volumes unreadable ({err.__class__.__name__}); "
-                 "'source volume exists' is reported as unknown here.")
+                 "%s: volumes unreadable (%s); 'source volume exists' is "
+                 "reported as unknown here." % (region, err.__class__.__name__))
             live_volumes = set()
             volumes_known = False
         else:
@@ -677,7 +728,7 @@ def scan_ebs_snapshots(session: Any, regions: Sequence[str],
             while pages < MAX_SNAPSHOT_PAGES:
                 # OwnerIds=self is essential. Without it this returns every
                 # public and shared snapshot in the region.
-                kwargs: Dict[str, Any] = {"OwnerIds": ["self"], "MaxResults": 1000}
+                kwargs = {"OwnerIds": ["self"], "MaxResults": 1000}
                 if token:
                     kwargs["NextToken"] = token
                 resp = ec2.describe_snapshots(**kwargs)
@@ -722,12 +773,14 @@ def scan_ebs_snapshots(session: Any, regions: Sequence[str],
                     break
             if token:
                 note("EBS",
-                     f"{region}: stopped at {MAX_SNAPSHOT_PAGES} pages of "
-                     "snapshots; the list for this region is partial.")
+                     "%s: stopped at %d pages of snapshots; the list for this "
+                     "region is partial." % (region, MAX_SNAPSHOT_PAGES))
         except Exception as err:  # noqa: BLE001
-            note("EBS",
-                 f"{region}: snapshots unreadable ({err.__class__.__name__}).")
-    return rows
+            note("EBS", "%s: snapshots unreadable (%s)."
+                 % (region, err.__class__.__name__))
+        return rows
+
+    return map_regions(one_region, regions, "EBS")
 
 
 def is_orphan(row: Dict[str, Any]) -> bool:
@@ -737,12 +790,13 @@ def is_orphan(row: Dict[str, Any]) -> bool:
 
 def scan_rds(session: Any, regions: Sequence[str]) -> List[Dict[str, Any]]:
     """RDS/Aurora retention settings and manual snapshot inventory."""
-    rows: List[Dict[str, Any]] = []
-    for region in regions:
+
+    def one_region(region: str) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
         try:
-            rds = session.client("rds", region_name=region, config=BOTO_CONFIG)
+            rds = make_client(session, "rds", region)
         except Exception:  # noqa: BLE001
-            continue
+            return rows
 
         # Clusters first, so their member instances can be skipped below —
         # describe_db_instances returns Aurora members too and they would
@@ -769,7 +823,8 @@ def scan_rds(session: Any, regions: Sequence[str]) -> List[Dict[str, Any]]:
                 if not marker:
                     break
         except Exception as err:  # noqa: BLE001
-            note("RDS", f"{region}: clusters unreadable ({err.__class__.__name__}).")
+            note("RDS", "%s: clusters unreadable (%s)."
+                 % (region, err.__class__.__name__))
 
         try:
             marker = None
@@ -793,7 +848,12 @@ def scan_rds(session: Any, regions: Sequence[str]) -> List[Dict[str, Any]]:
                 if not marker:
                     break
         except Exception as err:  # noqa: BLE001
-            note("RDS", f"{region}: instances unreadable ({err.__class__.__name__}).")
+            note("RDS", "%s: instances unreadable (%s)."
+                 % (region, err.__class__.__name__))
+
+        if not rows:
+            # Nothing here — skip two more round trips per region.
+            return rows
 
         # Manual snapshots, counted against their source.
         counts: Dict[str, int] = defaultdict(int)
@@ -803,32 +863,35 @@ def scan_rds(session: Any, regions: Sequence[str]) -> List[Dict[str, Any]]:
         ):
             try:
                 marker = None
-                while True:
-                    kwargs: Dict[str, Any] = {"SnapshotType": "manual"}
+                pages = 0
+                while pages < MAX_SNAPSHOT_PAGES:
+                    kwargs = {"SnapshotType": "manual"}
                     if marker:
                         kwargs["Marker"] = marker
                     resp = call(**kwargs)
                     for s in resp.get(key, []):
                         counts[s.get(id_key, "")] += 1
                     marker = resp.get("Marker")
+                    pages += 1
                     if not marker:
                         break
             except Exception as err:  # noqa: BLE001
-                note("RDS",
-                     f"{region}: manual snapshots unreadable "
-                     f"({err.__class__.__name__}).")
+                note("RDS", "%s: manual snapshots unreadable (%s)."
+                     % (region, err.__class__.__name__))
         for row in rows:
-            if row["region"] == region:
-                row["manual_snapshots"] = counts.get(row["identifier"], 0)
-    return rows
+            row["manual_snapshots"] = counts.get(row["identifier"], 0)
+        return rows
+
+    return map_regions(one_region, regions, "RDS")
 
 
 def scan_dynamodb(session: Any, regions: Sequence[str]) -> List[Dict[str, Any]]:
     """DynamoDB tables with PITR status and on-demand backup counts."""
-    rows: List[Dict[str, Any]] = []
-    for region in regions:
+
+    def one_region(region: str) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
         try:
-            ddb = session.client("dynamodb", region_name=region, config=BOTO_CONFIG)
+            ddb = make_client(session, "dynamodb", region)
             tables: List[str] = []
             start = None
             while True:
@@ -839,9 +902,9 @@ def scan_dynamodb(session: Any, regions: Sequence[str]) -> List[Dict[str, Any]]:
                 if not start:
                     break
         except Exception as err:  # noqa: BLE001
-            note("DynamoDB",
-                 f"{region}: tables unreadable ({err.__class__.__name__}).")
-            continue
+            note("DynamoDB", "%s: tables unreadable (%s)."
+                 % (region, err.__class__.__name__))
+            return rows
 
         for table in tables:
             size_bytes = None
@@ -883,18 +946,22 @@ def scan_dynamodb(session: Any, regions: Sequence[str]) -> List[Dict[str, Any]]:
                 "pitr": pitr,
                 "on_demand_backups": backups,
             })
-    return rows
+        return rows
+
+    return map_regions(one_region, regions, "DynamoDB")
 
 
 def scan_redshift(session: Any, regions: Sequence[str]) -> List[Dict[str, Any]]:
     """Redshift manual snapshot inventory."""
-    rows: List[Dict[str, Any]] = []
-    for region in regions:
+
+    def one_region(region: str) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
         try:
-            rs = session.client("redshift", region_name=region, config=BOTO_CONFIG)
+            rs = make_client(session, "redshift", region)
             marker = None
             counts: Dict[str, int] = defaultdict(int)
-            while True:
+            pages = 0
+            while pages < MAX_SNAPSHOT_PAGES:
                 kwargs: Dict[str, Any] = {"SnapshotType": "manual"}
                 if marker:
                     kwargs["Marker"] = marker
@@ -902,6 +969,7 @@ def scan_redshift(session: Any, regions: Sequence[str]) -> List[Dict[str, Any]]:
                 for s in resp.get("Snapshots", []):
                     counts[s.get("ClusterIdentifier", "")] += 1
                 marker = resp.get("Marker")
+                pages += 1
                 if not marker:
                     break
             for cluster, count in sorted(counts.items()):
@@ -911,11 +979,15 @@ def scan_redshift(session: Any, regions: Sequence[str]) -> List[Dict[str, Any]]:
                     "manual_snapshots": count,
                 })
         except Exception as err:  # noqa: BLE001
-            name = err.__class__.__name__
-            # Redshift is not enabled in every region; that is not an error.
+            # Redshift is not enabled in every region; that is not an error
+            # worth reporting unless it is a permission problem.
             if "AccessDenied" in str(err) or "UnauthorizedOperation" in str(err):
-                note("Redshift", f"{region}: access denied ({name}).")
-    return rows
+                note("Redshift", "%s: access denied (%s)."
+                     % (region, err.__class__.__name__))
+        return rows
+
+    return map_regions(one_region, regions, "Redshift")
+
 
 # ---------------------------------------------------------------------------
 # Workbook
@@ -1399,6 +1471,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--months", type=int, default=12,
                         help="Months of Cost Explorer history (default 12, max 12)")
     parser.add_argument("--output", help="Output .xlsx path")
+    parser.add_argument("--regions", metavar="LIST",
+                        help="Comma-separated regions to scan instead of "
+                             "every enabled one, e.g. us-east-1,eu-west-1. "
+                             "Faster, but anything elsewhere is missed.")
     parser.add_argument("--assume-role", metavar="ROLE_NAME",
                         help="Also gather the INVENTORY from every account in "
                              "the organization by assuming this role name in "
@@ -1463,9 +1539,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             rows.sort(key=lambda r: r["total"], reverse=True)
             org = {"rows": rows, "unavailable": unavailable}
 
-    print("Listing enabled regions ...")
-    regions = enabled_regions(session)
-    print("  %d region(s)" % len(regions))
+    if args.regions:
+        regions = [r.strip() for r in args.regions.split(",") if r.strip()]
+        note("Regions",
+             "Limited to %s by --regions. Backup storage in any other "
+             "region is NOT in this report." % ", ".join(regions))
+        print("Regions: %d (from --regions)" % len(regions))
+    else:
+        print("Listing enabled regions ...")
+        regions = enabled_regions(session)
+        print("  %d region(s), scanned %d at a time"
+              % (len(regions), REGION_WORKERS))
 
     inventory_accounts: List[Dict[str, str]] = []
     if args.assume_role and org:
@@ -1503,6 +1587,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     continue
             print("  %s  %s" % (target, entry.get("name", "")))
             found = scan_account_inventory(member, regions, generated, target)
+            print("      vaults %d | snapshots %d | rds %d | dynamodb %d | "
+                  "redshift %d"
+                  % (len(found["vaults"]), len(found["snapshots"]),
+                     len(found["rds"]), len(found["ddb"]),
+                     len(found["redshift"])))
             vaults.extend(found["vaults"])
             snapshots.extend(found["snapshots"])
             rds.extend(found["rds"])
