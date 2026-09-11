@@ -1,0 +1,96 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  Read-only role that lets your AWS Organization's management account gather a
+  backup inventory from this account. Deploy as a CloudFormation StackSet
+  across the organization, then run aws_backup_cost_report.py from the
+  management account with --assume-role BackupReportReadOnly.
+
+  Only needed if this account does not already have
+  OrganizationAccountAccessRole (accounts INVITED into an organization do not;
+  accounts CREATED through it do). Try that role first.
+
+  Grants no write permission of any kind. Every action is a List, Describe or
+  Get, and the trust is limited to one account you name.
+
+Parameters:
+  ManagementAccountId:
+    Type: String
+    Description: >
+      The 12-digit AWS account ID of your organization's management account —
+      the account you will run the report from. This is the ONLY principal
+      allowed to assume this role.
+    AllowedPattern: "^[0-9]{12}$"
+    ConstraintDescription: Must be a 12-digit AWS account ID.
+
+  RoleName:
+    Type: String
+    Default: BackupReportReadOnly
+    Description: >
+      Name of the role to create. It must be IDENTICAL in every account,
+      because the report builds arn:aws:iam::<account>:role/<RoleName> for
+      each one. IAM role names are CASE-SENSITIVE inside an ARN, so a
+      near-miss fails on every account at once.
+    AllowedPattern: "^[A-Za-z0-9+=,.@_-]{1,64}$"
+
+Resources:
+  BackupReportRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      Description: Read-only access for the AWS backup cost report.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # The customer runs the report themselves from their own management
+          # account, so this trusts THEIR account and nobody else. There is no
+          # third party and therefore no sts:ExternalId condition to get wrong.
+          #
+          # AWS reads `<account>:root` as "any principal in that account that
+          # also has sts:AssumeRole on its own identity policy" — so the caller
+          # needs that permission too. The trust alone is not sufficient.
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${ManagementAccountId}:root"
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BackupReportReadOnly
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ListAndDescribeBackupResources
+                Effect: Allow
+                Resource: "*"
+                Action:
+                  # Regions to scan.
+                  - ec2:DescribeRegions
+                  # EBS snapshots and whether their source volume survives.
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeSnapshots
+                  # AWS Backup vaults, and recovery points for size by tier.
+                  - backup:ListBackupVaults
+                  - backup:ListRecoveryPointsByBackupVault
+                  # RDS retention settings and manual snapshots. Also covers
+                  # Neptune and DocumentDB, which ride the RDS control plane.
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDBClusters
+                  - rds:DescribeDBSnapshots
+                  - rds:DescribeDBClusterSnapshots
+                  # DynamoDB PITR and on-demand backups.
+                  - dynamodb:ListTables
+                  - dynamodb:DescribeTable
+                  - dynamodb:DescribeContinuousBackups
+                  - dynamodb:ListBackups
+                  # Redshift manual snapshots.
+                  - redshift:DescribeClusterSnapshots
+
+Outputs:
+  RoleArn:
+    Description: ARN of the created role.
+    Value: !GetAtt BackupReportRole.Arn
+
+  RoleNameOut:
+    Description: >
+      Pass this to the report as --assume-role. It must match in every account.
+    Value: !Ref RoleName

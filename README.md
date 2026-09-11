@@ -43,6 +43,8 @@ Options:
 --profile NAME    AWS profile to use (default: the standard credential chain)
 --months N        Months of history, 1 to 12 (default: 12)
 --output FILE     Output path (default: aws-backup-costs-YYYY-MM-DD.xlsx)
+--assume-role R   Gather the inventory from every org account by assuming
+                  role R in each (case-sensitive)
 --single-account  Skip the per-account breakdown in an organization
 ```
 
@@ -92,9 +94,39 @@ So from a management account you get org-wide **spend**, and single-account
 **inventory**. The Notes sheet states both scopes explicitly so a reader cannot
 mistake one for the other.
 
-If you need the inventory org-wide too, the options are a CloudFormation
-StackSet deploying a read-only role to every account, or simply running the
-script once per account with separate profiles.
+### Getting the inventory org-wide too
+
+Pass `--assume-role ROLE_NAME`. The script assumes that role in each account
+and gathers the inventory from all of them. Every inventory sheet leads with
+an **Account** column, so rows are always attributable.
+
+```bash
+python aws_backup_cost_report.py --assume-role OrganizationAccountAccessRole
+```
+
+**Try `OrganizationAccountAccessRole` first — you may not need to deploy
+anything.** It already exists in accounts *created* through Organizations, and
+the management account can assume it. Accounts *invited* into the organization
+do not have it.
+
+If some accounts lack a usable role, deploy `backup-report-role.yaml` as a
+CloudFormation **StackSet** across the organization, then use
+`--assume-role BackupReportReadOnly`. The template creates a read-only role
+trusting only your management account. There is no external ID, because you
+are running this yourself rather than granting a third party access.
+
+Two things to know about StackSets:
+
+- A **service-managed** StackSet does **not** deploy to the management
+  account. Deploy a normal stack there separately if you need its inventory.
+- The role name must be **identical in every account**, and IAM role names are
+  **case-sensitive** inside an ARN. A near-miss fails on every account at once.
+
+An account the script cannot reach is skipped, named on the Notes sheet along
+with the ARN it tried, and the run continues.
+
+If you would rather deploy nothing at all, run the script once per account
+with separate profiles.
 
 ## Exporting to PDF
 

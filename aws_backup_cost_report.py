@@ -481,6 +481,63 @@ def fetch_spend(session: Any, months: int, now: dt.datetime,
 # Inventory
 # ---------------------------------------------------------------------------
 
+def assume_account_session(session: Any, account_id: str,
+                           role_name: str) -> Optional[Any]:
+    """A boto3 session holding temporary credentials in a member account.
+
+    Because the customer runs this script themselves, the role only has to
+    trust their OWN management account — no external ID and no third-party
+    trust, which removes the whole class of "wrong ExternalId" failures
+    that third-party assume-role integrations are prone to.
+
+    Returns None on failure, with the reason recorded. A single
+    inaccessible account must never fail the run.
+    """
+    role_arn = "arn:aws:iam::%s:role/%s" % (account_id, role_name)
+    try:
+        sts = session.client("sts", config=BOTO_CONFIG)
+        creds = sts.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName="backup-cost-report",
+        )["Credentials"]
+        return boto3.Session(
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"],
+        )
+    except Exception as err:  # noqa: BLE001
+        raw = str(err)
+        if "AccessDenied" in raw or "not authorized" in raw:
+            detail = ("access denied assuming %s. Check the role exists in "
+                      "that account and trusts this one. IAM role names are "
+                      "CASE-SENSITIVE inside an ARN." % role_arn)
+        else:
+            detail = "%s assuming %s" % (err.__class__.__name__, role_arn)
+        note("Organization inventory", "%s: %s" % (account_id, detail))
+        return None
+
+
+def scan_account_inventory(session: Any, regions: Sequence[str],
+                           now: dt.datetime, account_id: str
+                           ) -> Dict[str, List[Dict[str, Any]]]:
+    """Run every inventory scanner against one account and tag the rows.
+
+    The scanners all take a session as their first argument, so covering a
+    whole organisation is a loop over sessions rather than a rewrite.
+    """
+    result = {
+        "vaults": scan_vaults(session, regions),
+        "snapshots": scan_ebs_snapshots(session, regions, now),
+        "rds": scan_rds(session, regions),
+        "ddb": scan_dynamodb(session, regions),
+        "redshift": scan_redshift(session, regions),
+    }
+    for rows in result.values():
+        for row in rows:
+            row["account"] = account_id
+    return result
+
+
 def enabled_regions(session: Any) -> List[str]:
     """Regions this account has enabled, including opt-in regions.
 
@@ -1076,55 +1133,62 @@ def sheet_monthly_detail(wb: Any, spend: SpendData, account_id: str) -> None:
 
 def sheet_vaults(wb: Any, vaults: List[Dict[str, Any]], account_id: str) -> None:
     ws = wb.create_sheet("Vaults")
-    write_header(ws, 1, ["Region", "Vault", "Recovery points", "Warm (GiB)",
-                         "Cold (GiB)", "Total (GiB)", "Oldest", "Newest",
-                         "Locked", "Truncated"])
+    write_header(ws, 1, ["Account", "Region", "Vault", "Recovery points",
+                         "Warm (GiB)", "Cold (GiB)", "Total (GiB)", "Oldest",
+                         "Newest", "Locked", "Truncated"])
     row = 2
-    for v in sorted(vaults, key=lambda r: (r["region"], r["vault"])):
-        ws.cell(row=row, column=1, value=v["region"])
-        ws.cell(row=row, column=2, value=v["vault"])
-        ws.cell(row=row, column=3, value=v["recovery_points"])
-        ws.cell(row=row, column=4, value=v["warm_gib"]).number_format = SIZE_FMT
-        ws.cell(row=row, column=5, value=v["cold_gib"]).number_format = SIZE_FMT
-        ws.cell(row=row, column=6, value=v["total_gib"]).number_format = SIZE_FMT
-        for col, key in ((7, "oldest"), (8, "newest")):
+    for v in sorted(vaults, key=lambda r: (r.get("account", ""), r["region"],
+                                           r["vault"])):
+        ws.cell(row=row, column=1, value=v.get("account", ""))
+        ws.cell(row=row, column=2, value=v["region"])
+        ws.cell(row=row, column=3, value=v["vault"])
+        ws.cell(row=row, column=4, value=v["recovery_points"])
+        ws.cell(row=row, column=5, value=v["warm_gib"]).number_format = SIZE_FMT
+        ws.cell(row=row, column=6, value=v["cold_gib"]).number_format = SIZE_FMT
+        ws.cell(row=row, column=7, value=v["total_gib"]).number_format = SIZE_FMT
+        for col, key in ((8, "oldest"), (9, "newest")):
             cell = ws.cell(row=row, column=col, value=_naive(v.get(key)))
             cell.number_format = 'yyyy-mm-dd'
-        ws.cell(row=row, column=9, value=v["locked"])
-        ws.cell(row=row, column=10, value=v["truncated"])
+        ws.cell(row=row, column=10, value=v["locked"])
+        ws.cell(row=row, column=11, value=v["truncated"])
         row += 1
     if row == 2:
         ws.cell(row=2, column=1, value="No AWS Backup vaults found in the scanned regions.")
-    finish_sheet(ws, [16, 34, 16, 14, 14, 14, 14, 14, 10, 12], account_id, freeze="A2")
+    finish_sheet(ws, [16, 16, 34, 16, 14, 14, 14, 14, 14, 10, 12], account_id,
+                 freeze="B2")
 
 
 def sheet_snapshots(wb: Any, snapshots: List[Dict[str, Any]], account_id: str) -> None:
     ws = wb.create_sheet("Snapshots")
-    write_header(ws, 1, ["Region", "Snapshot", "Source volume", "Size (GiB)",
-                         "Created", "Age (days)", "Volume exists",
-                         "In AWS Backup", "Orphaned", "Description"])
+    write_header(ws, 1, ["Account", "Region", "Snapshot", "Source volume",
+                         "Size (GiB)", "Created", "Age (days)",
+                         "Volume exists", "In AWS Backup", "Orphaned",
+                         "Description"])
     row = 2
-    for s in sorted(snapshots, key=lambda r: (r["region"], r["snapshot"])):
+    for s in sorted(snapshots, key=lambda r: (r.get("account", ""), r["region"],
+                                              r["snapshot"])):
         orphan = is_orphan(s)
-        ws.cell(row=row, column=1, value=s["region"])
-        ws.cell(row=row, column=2, value=s["snapshot"])
-        ws.cell(row=row, column=3, value=s["volume"])
-        ws.cell(row=row, column=4, value=s["size_gib"]).number_format = '#,##0'
-        cell = ws.cell(row=row, column=5, value=_naive(s.get("created")))
+        ws.cell(row=row, column=1, value=s.get("account", ""))
+        ws.cell(row=row, column=2, value=s["region"])
+        ws.cell(row=row, column=3, value=s["snapshot"])
+        ws.cell(row=row, column=4, value=s["volume"])
+        ws.cell(row=row, column=5, value=s["size_gib"]).number_format = '#,##0'
+        cell = ws.cell(row=row, column=6, value=_naive(s.get("created")))
         cell.number_format = 'yyyy-mm-dd'
-        ws.cell(row=row, column=6, value=s.get("age_days"))
-        ws.cell(row=row, column=7, value=s["volume_exists"])
-        ws.cell(row=row, column=8, value=s["in_aws_backup"])
-        ws.cell(row=row, column=9, value="yes" if orphan else "no")
-        ws.cell(row=row, column=10, value=s["description"])
+        ws.cell(row=row, column=7, value=s.get("age_days"))
+        ws.cell(row=row, column=8, value=s["volume_exists"])
+        ws.cell(row=row, column=9, value=s["in_aws_backup"])
+        ws.cell(row=row, column=10, value="yes" if orphan else "no")
+        ws.cell(row=row, column=11, value=s["description"])
         if orphan:
             # Highlight the whole row: these are the ones worth acting on.
-            for col in range(1, 11):
+            for col in range(1, 12):
                 ws.cell(row=row, column=col).fill = WARN_FILL
         row += 1
     if row == 2:
         ws.cell(row=2, column=1, value="No self-owned EBS snapshots found.")
-    finish_sheet(ws, [16, 24, 22, 12, 14, 12, 14, 14, 12, 46], account_id, freeze="A2")
+    finish_sheet(ws, [16, 16, 24, 22, 12, 14, 12, 14, 14, 12, 46], account_id,
+                 freeze="B2")
 
 
 def sheet_rds_dynamodb(wb: Any, rds: List[Dict[str, Any]],
@@ -1134,21 +1198,23 @@ def sheet_rds_dynamodb(wb: Any, rds: List[Dict[str, Any]],
 
     ws["A1"] = "RDS / Aurora"
     ws["A1"].font = TITLE_FONT
-    write_header(ws, 2, ["Region", "Type", "Identifier", "Engine",
+    write_header(ws, 2, ["Account", "Region", "Type", "Identifier", "Engine",
                          "Automated retention (days)", "Manual snapshots",
                          "Deletion protection"])
     row = 3
-    for r in sorted(rds, key=lambda x: (x["region"], x["identifier"])):
-        ws.cell(row=row, column=1, value=r["region"])
-        ws.cell(row=row, column=2, value=r["kind"])
-        ws.cell(row=row, column=3, value=r["identifier"])
-        ws.cell(row=row, column=4, value=r["engine"])
-        retention = ws.cell(row=row, column=5, value=r["retention_days"])
+    for r in sorted(rds, key=lambda x: (x.get("account", ""), x["region"],
+                                        x["identifier"])):
+        ws.cell(row=row, column=1, value=r.get("account", ""))
+        ws.cell(row=row, column=2, value=r["region"])
+        ws.cell(row=row, column=3, value=r["kind"])
+        ws.cell(row=row, column=4, value=r["identifier"])
+        ws.cell(row=row, column=5, value=r["engine"])
+        retention = ws.cell(row=row, column=6, value=r["retention_days"])
         if not r["retention_days"]:
             # Retention 0 means automated backups are switched OFF.
             retention.fill = WARN_FILL
-        ws.cell(row=row, column=6, value=r["manual_snapshots"])
-        ws.cell(row=row, column=7, value=r["deletion_protection"])
+        ws.cell(row=row, column=7, value=r["manual_snapshots"])
+        ws.cell(row=row, column=8, value=r["deletion_protection"])
         row += 1
     if row == 3:
         ws.cell(row=row, column=1, value="No RDS instances or clusters found.")
@@ -1157,18 +1223,20 @@ def sheet_rds_dynamodb(wb: Any, rds: List[Dict[str, Any]],
     row += 2
     ws.cell(row=row, column=1, value="DynamoDB").font = TITLE_FONT
     row += 1
-    write_header(ws, row, ["Region", "Table", "Size (GiB)", "PITR",
+    write_header(ws, row, ["Account", "Region", "Table", "Size (GiB)", "PITR",
                            "On-demand backups"])
     row += 1
-    for t in sorted(ddb, key=lambda x: (x["region"], x["table"])):
-        ws.cell(row=row, column=1, value=t["region"])
-        ws.cell(row=row, column=2, value=t["table"])
-        ws.cell(row=row, column=3, value=t["size_gib"]).number_format = SIZE_FMT
-        pitr = ws.cell(row=row, column=4, value=t["pitr"])
+    for t in sorted(ddb, key=lambda x: (x.get("account", ""), x["region"],
+                                        x["table"])):
+        ws.cell(row=row, column=1, value=t.get("account", ""))
+        ws.cell(row=row, column=2, value=t["region"])
+        ws.cell(row=row, column=3, value=t["table"])
+        ws.cell(row=row, column=4, value=t["size_gib"]).number_format = SIZE_FMT
+        pitr = ws.cell(row=row, column=5, value=t["pitr"])
         if t["pitr"] == "disabled":
             pitr.fill = WARN_FILL
         count = t["on_demand_backups"]
-        ws.cell(row=row, column=5,
+        ws.cell(row=row, column=6,
                 value="unknown" if count is not None and count < 0 else count)
         row += 1
     if not ddb:
@@ -1179,20 +1247,23 @@ def sheet_rds_dynamodb(wb: Any, rds: List[Dict[str, Any]],
         row += 2
         ws.cell(row=row, column=1, value="Redshift").font = TITLE_FONT
         row += 1
-        write_header(ws, row, ["Region", "Cluster", "Manual snapshots"])
+        write_header(ws, row, ["Account", "Region", "Cluster",
+                               "Manual snapshots"])
         row += 1
         for c in redshift:
-            ws.cell(row=row, column=1, value=c["region"])
-            ws.cell(row=row, column=2, value=c["cluster"])
-            ws.cell(row=row, column=3, value=c["manual_snapshots"])
+            ws.cell(row=row, column=1, value=c.get("account", ""))
+            ws.cell(row=row, column=2, value=c["region"])
+            ws.cell(row=row, column=3, value=c["cluster"])
+            ws.cell(row=row, column=4, value=c["manual_snapshots"])
             row += 1
 
-    finish_sheet(ws, [16, 14, 40, 20, 24, 18, 20], account_id, header_row=2)
+    finish_sheet(ws, [16, 16, 14, 40, 20, 24, 18, 20], account_id, header_row=2)
 
 
 def sheet_notes(wb: Any, spend: SpendData, account_id: str, regions: Sequence[str],
                 start: str, end: str, generated: dt.datetime,
-                org: Optional[Dict[str, Any]] = None) -> None:
+                org: Optional[Dict[str, Any]] = None,
+                inventory_accounts: Optional[Sequence[str]] = None) -> None:
     ws = wb.create_sheet("Notes")
     if org:
         scope_label = ("Organization-wide, broken out across %d accounts "
@@ -1201,6 +1272,15 @@ def sheet_notes(wb: Any, spend: SpendData, account_id: str, regions: Sequence[st
         scope_label = ("Whatever this account's Cost Explorer covers. From a "
                        "management account that is the whole organization; "
                        "from a member account it is this account only.")
+    covered = list(inventory_accounts or [account_id])
+    if len(covered) > 1:
+        inventory_scope = ("%d accounts: %s. Gathered by assuming a read-only "
+                           "role in each." % (len(covered), ", ".join(covered)))
+    else:
+        inventory_scope = ("This account only (%s). Vaults, snapshots, RDS and "
+                           "DynamoDB are per-account APIs with no consolidated "
+                           "view; pass --assume-role to cover the organization."
+                           % covered[0])
     row = 1
     ws.cell(row=row, column=1, value="Run details").font = TITLE_FONT
     row += 2
@@ -1211,9 +1291,7 @@ def sheet_notes(wb: Any, spend: SpendData, account_id: str, regions: Sequence[st
         ("Regions scanned", "%d: %s" % (len(regions), ", ".join(regions))),
         ("Cost Explorer", "available" if spend.available else "UNAVAILABLE"),
         ("Spend scope", scope_label),
-        ("Inventory scope",
-         "This account only (%s). Vaults, snapshots, RDS and DynamoDB are "
-         "per-account APIs with no consolidated view." % account_id),
+        ("Inventory scope", inventory_scope),
     ):
         ws.cell(row=row, column=1, value=label).font = Font(bold=True)
         ws.cell(row=row, column=2, value=value).alignment = Alignment(wrap_text=True)
@@ -1295,7 +1373,8 @@ def build_workbook(path: str, spend: SpendData, vaults: List[Dict[str, Any]],
                    ddb: List[Dict[str, Any]], redshift: List[Dict[str, Any]],
                    account_id: str, regions: Sequence[str], start: str, end: str,
                    months: int, generated: dt.datetime,
-                   org: Optional[Dict[str, Any]] = None) -> None:
+                   org: Optional[Dict[str, Any]] = None,
+                   inventory_accounts: Optional[Sequence[str]] = None) -> None:
     wb = Workbook()
     sheet_summary(wb, spend, snapshots, account_id, start, end, months, org)
     if org:
@@ -1304,7 +1383,8 @@ def build_workbook(path: str, spend: SpendData, vaults: List[Dict[str, Any]],
     sheet_vaults(wb, vaults, account_id)
     sheet_snapshots(wb, snapshots, account_id)
     sheet_rds_dynamodb(wb, rds, ddb, redshift, account_id)
-    sheet_notes(wb, spend, account_id, regions, start, end, generated, org)
+    sheet_notes(wb, spend, account_id, regions, start, end, generated, org,
+                inventory_accounts)
     wb.save(path)
 
 
@@ -1319,6 +1399,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--months", type=int, default=12,
                         help="Months of Cost Explorer history (default 12, max 12)")
     parser.add_argument("--output", help="Output .xlsx path")
+    parser.add_argument("--assume-role", metavar="ROLE_NAME",
+                        help="Also gather the INVENTORY from every account in "
+                             "the organization by assuming this role name in "
+                             "each. Try OrganizationAccountAccessRole first; "
+                             "it already exists in accounts created through "
+                             "Organizations. Case-sensitive.")
     parser.add_argument("--single-account", action="store_true",
                         help="Skip the per-account breakdown even when run "
                              "from a management account")
@@ -1381,19 +1467,70 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     regions = enabled_regions(session)
     print("  %d region(s)" % len(regions))
 
-    print("Scanning AWS Backup vaults ...")
-    vaults = scan_vaults(session, regions)
-    print("Scanning EBS snapshots ...")
-    snapshots = scan_ebs_snapshots(session, regions, generated)
-    print("Scanning RDS ...")
-    rds = scan_rds(session, regions)
-    print("Scanning DynamoDB ...")
-    ddb = scan_dynamodb(session, regions)
-    print("Scanning Redshift ...")
-    redshift = scan_redshift(session, regions)
+    inventory_accounts: List[Dict[str, str]] = []
+    if args.assume_role and org:
+        inventory_accounts = [{"id": e["id"], "name": e["name"]}
+                              for e in org["rows"]]
+        for entry in org["unavailable"]:
+            inventory_accounts.append(entry)
+    elif args.assume_role and not org:
+        note("Organization inventory",
+             "--assume-role was given but the organization could not be "
+             "listed, so the inventory covers this account only.")
+
+    vaults: List[Dict[str, Any]] = []
+    snapshots: List[Dict[str, Any]] = []
+    rds: List[Dict[str, Any]] = []
+    ddb: List[Dict[str, Any]] = []
+    redshift: List[Dict[str, Any]] = []
+    inventory_scope_accounts = [account_id]
+
+    if inventory_accounts:
+        print("Gathering inventory across %d account(s) via role %s ..."
+              % (len(inventory_accounts), args.assume_role))
+        reached = []
+        for entry in inventory_accounts:
+            target = entry["id"]
+            if target == account_id:
+                # No point assuming a role into ourselves, and the role often
+                # is not deployed to the management account at all — a
+                # service-managed StackSet skips it.
+                member = session
+            else:
+                member = assume_account_session(session, target, args.assume_role)
+                if member is None:
+                    print("  %s  skipped (see Notes)" % target)
+                    continue
+            print("  %s  %s" % (target, entry.get("name", "")))
+            found = scan_account_inventory(member, regions, generated, target)
+            vaults.extend(found["vaults"])
+            snapshots.extend(found["snapshots"])
+            rds.extend(found["rds"])
+            ddb.extend(found["ddb"])
+            redshift.extend(found["redshift"])
+            reached.append(target)
+        inventory_scope_accounts = reached
+        note("Organization inventory",
+             "Inventory gathered from %d of %d accounts using role %s."
+             % (len(reached), len(inventory_accounts), args.assume_role))
+    else:
+        print("Scanning AWS Backup vaults ...")
+        vaults = scan_vaults(session, regions)
+        print("Scanning EBS snapshots ...")
+        snapshots = scan_ebs_snapshots(session, regions, generated)
+        print("Scanning RDS ...")
+        rds = scan_rds(session, regions)
+        print("Scanning DynamoDB ...")
+        ddb = scan_dynamodb(session, regions)
+        print("Scanning Redshift ...")
+        redshift = scan_redshift(session, regions)
+        for rows in (vaults, snapshots, rds, ddb, redshift):
+            for row in rows:
+                row["account"] = account_id
 
     build_workbook(output, spend, vaults, snapshots, rds, ddb, redshift,
-                   account_id, regions, start, end, months, generated, org)
+                   account_id, regions, start, end, months, generated, org,
+                   inventory_scope_accounts)
 
     print("")
     if spend.available:
