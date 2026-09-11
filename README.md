@@ -43,6 +43,7 @@ Options:
 --profile NAME    AWS profile to use (default: the standard credential chain)
 --months N        Months of history, 1 to 12 (default: 12)
 --output FILE     Output path (default: aws-backup-costs-YYYY-MM-DD.xlsx)
+--single-account  Skip the per-account breakdown in an organization
 ```
 
 Examples:
@@ -62,6 +63,39 @@ so a run costs a few cents. Everything else the script calls is free.
 It scans every region your account has enabled, so a few minutes on a large
 estate is normal. Progress is printed as it goes.
 
+## Running across an AWS Organization
+
+Run it **from the management (payer) account** and spend is reported for every
+member account.
+
+That works because Cost Explorer in a management account already reports
+consolidated billing for the whole organization. The script detects the
+organization, lists the active accounts, and breaks the spend out per account
+on a **By account** sheet and in a table on the Summary.
+
+If `organizations:ListAccounts` is unavailable — because you are in a member
+account, or the permission is missing — the report still runs. The totals are
+whatever that account's Cost Explorer covers, and the Notes sheet says which
+case applies rather than leaving it ambiguous.
+
+Cost: one extra Cost Explorer request per account, at $0.01 each. Five accounts
+is five cents. Use `--single-account` to skip the breakdown.
+
+### What is not organization-wide
+
+**The inventory sheets cover only the account the script runs in.** Vaults,
+snapshots, RDS and DynamoDB are per-account APIs with no consolidated view, so
+covering every account would need a read-only role deployed into each one and
+assumed in turn.
+
+So from a management account you get org-wide **spend**, and single-account
+**inventory**. The Notes sheet states both scopes explicitly so a reader cannot
+mistake one for the other.
+
+If you need the inventory org-wide too, the options are a CloudFormation
+StackSet deploying a read-only role to every account, or simply running the
+script once per account with separate profiles.
+
 ## Exporting to PDF
 
 Every sheet already has a print area, landscape orientation, fit-to-width, a
@@ -77,6 +111,7 @@ needed and the script does not generate PDFs itself.
 | Sheet | What it tells you |
 | --- | --- |
 | **Summary** | Total backup spend for the window, the monthly trend, the breakdown by category, and the ten most expensive usage types. This is the page to read first, and it is sized to print on one landscape page. |
+| **By account** | One row per organization account with its backup spend by category. Only present when the run could list the organization, i.e. from a management account. |
 | **Monthly detail** | Every backup line item, month by service by usage type, as raw numbers. This is the audit trail behind the Summary. |
 | **Vaults** | Every AWS Backup vault: recovery-point count, size split by warm and cold tier, and the oldest and newest recovery point. |
 | **Snapshots** | Every EBS snapshot you own, with size, age, whether its source volume still exists, and whether AWS Backup created it. **Orphaned snapshots are highlighted** — see below. |
@@ -135,6 +170,7 @@ Minimal read-only policy. Every action is a List, Describe or Get.
         "ce:GetCostAndUsage",
         "ce:GetDimensionValues",
         "sts:GetCallerIdentity",
+        "organizations:ListAccounts",
         "ec2:DescribeRegions",
         "ec2:DescribeVolumes",
         "ec2:DescribeSnapshots",
@@ -155,6 +191,9 @@ Minimal read-only policy. Every action is a List, Describe or Get.
   ]
 }
 ```
+
+`organizations:ListAccounts` is only needed for the per-account breakdown, and
+only exists in a management account. Without it the script still runs.
 
 Note that **`ce:*` is not part of the AWS managed `ReadOnlyAccess` policy** and
 has to be granted separately. If Cost Explorer is denied, the script says so on

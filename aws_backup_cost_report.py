@@ -260,6 +260,92 @@ def explain_ce_error(err: Exception) -> str:
     return f"Cost Explorer query failed: {raw}. The inventory sheets are unaffected."
 
 
+def _spend_filter(linked_account: Optional[str] = None) -> Dict[str, Any]:
+    """Server-side Cost Explorer filter.
+
+    Always narrows to the services that can carry backup line items. When a
+    linked account is given, that is AND-ed on so the same query can be
+    reused per account without touching the GroupBy dimensions.
+    """
+    service = {"Dimensions": {"Key": "SERVICE", "Values": BACKUP_SERVICES}}
+    if linked_account is None:
+        return service
+    return {"And": [
+        service,
+        {"Dimensions": {"Key": "LINKED_ACCOUNT", "Values": [linked_account]}},
+    ]}
+
+
+def list_org_accounts(session: Any) -> Optional[List[Dict[str, str]]]:
+    """Every ACTIVE account in the organisation, or None.
+
+    None means this is not a management account, or the caller lacks
+    organizations:ListAccounts. Either way the report falls back to the
+    consolidated view, which is still org-wide in total — just not split
+    per account.
+    """
+    try:
+        org = session.client("organizations", region_name="us-east-1",
+                             config=BOTO_CONFIG)
+        accounts: List[Dict[str, str]] = []
+        token = None
+        while True:
+            kwargs = {"NextToken": token} if token else {}
+            resp = org.list_accounts(**kwargs)
+            for a in resp.get("Accounts", []):
+                if a.get("Status") != "ACTIVE":
+                    continue
+                accounts.append({"id": a.get("Id", ""),
+                                 "name": a.get("Name", "")})
+            token = resp.get("NextToken")
+            if not token:
+                break
+        return sorted(accounts, key=lambda a: a["name"].lower()) or None
+    except Exception as err:  # noqa: BLE001
+        raw = str(err)
+        if "AWSOrganizationsNotInUseException" in raw:
+            note("Organization",
+                 "This account is not part of an AWS Organization; the report "
+                 "covers this account only.")
+        elif "AccessDenied" in raw or "not authorized" in raw:
+            note("Organization",
+                 "Could not list organization accounts (access denied). Run "
+                 "from the management account with organizations:ListAccounts "
+                 "to break spend out per account. Totals from a management "
+                 "account are still org-wide; from a member account they "
+                 "cover that account only.")
+        else:
+            note("Organization",
+                 f"Organization lookup failed ({err.__class__.__name__}); the "
+                 "report covers whatever the credentials can see.")
+        return None
+
+
+def fetch_spend_by_account(session: Any, months: int, now: dt.datetime,
+                           accounts: List[Dict[str, str]]
+                           ) -> "Dict[str, SpendData]":
+    """Re-run the spend query once per linked account.
+
+    Each pass is one more Cost Explorer request at $0.01. Deliberately a
+    loop rather than a LINKED_ACCOUNT GroupBy: the two GroupBy slots are
+    already used by SERVICE and USAGE_TYPE, and dropping either would break
+    the classification rules.
+    """
+    out: Dict[str, SpendData] = {}
+    for account in accounts:
+        account_id = account["id"]
+        out[account_id] = fetch_spend(session, months, now,
+                                      linked_account=account_id,
+                                      discover=False)
+    denied = [a["id"] for a in accounts if not out[a["id"]].available]
+    if denied:
+        note("Organization",
+             f"{len(denied)} of {len(accounts)} accounts returned no Cost "
+             "Explorer data; their rows show as unavailable and are excluded "
+             "from the per-account table.")
+    return out
+
+
 def discover_usage_types(ce: Any, start: str, end: str) -> List[str]:
     """Ask Cost Explorer which USAGE_TYPE values this account actually has.
 
@@ -290,14 +376,30 @@ def discover_usage_types(ce: Any, start: str, end: str) -> List[str]:
     return values
 
 
-def fetch_spend(session: Any, months: int, now: dt.datetime) -> SpendData:
+def fetch_spend(session: Any, months: int, now: dt.datetime,
+                linked_account: Optional[str] = None,
+                discover: bool = True) -> SpendData:
+    """Backup spend for the whole payer scope, or for ONE linked account.
+
+    Cost Explorer in a management account reports consolidated billing for
+    every member account, so the unfiltered call is already org-wide. The
+    per-account breakdown re-runs the SAME query with a LINKED_ACCOUNT
+    filter added, which keeps classification byte-identical rather than
+    regrouping — Cost Explorer allows only two GroupBy dimensions and both
+    are already spent on SERVICE and USAGE_TYPE, which the rules need.
+    """
     data = SpendData()
     start, end = months_back(now, months)
     # Cost Explorer is a global service anchored in us-east-1; one call covers
     # the whole account regardless of where the workloads run.
     ce = session.client("ce", region_name="us-east-1", config=BOTO_CONFIG)
 
-    try:
+    if not discover:
+        # Per-account passes skip discovery: the usage types are the same
+        # ones the org-wide pass already listed, and each call costs $0.01.
+        pass
+    else:
+      try:
         discovered = discover_usage_types(ce, start, end)
         data.discovered_usage_types = len(discovered)
         matched_preview = [u for u in discovered if classify("AWS Backup", u) or
@@ -306,7 +408,7 @@ def fetch_spend(session: Any, months: int, now: dt.datetime) -> SpendData:
              f"Discovered {len(discovered)} usage types in the window; "
              f"{len(matched_preview)} matched a backup pattern on a first pass. "
              "Final attribution is per line item and is listed below.")
-    except Exception as err:  # noqa: BLE001 - discovery is best effort
+      except Exception as err:  # noqa: BLE001 - discovery is best effort
         note("Cost Explorer",
              f"Usage-type discovery failed ({err.__class__.__name__}); "
              "classification still ran against the live line items.")
@@ -319,7 +421,7 @@ def fetch_spend(session: Any, months: int, now: dt.datetime) -> SpendData:
                 "TimePeriod": {"Start": start, "End": end},
                 "Granularity": "MONTHLY",
                 "Metrics": ["UnblendedCost"],
-                "Filter": {"Dimensions": {"Key": "SERVICE", "Values": BACKUP_SERVICES}},
+                "Filter": _spend_filter(linked_account),
                 "GroupBy": [
                     {"Type": "DIMENSION", "Key": "SERVICE"},
                     {"Type": "DIMENSION", "Key": "USAGE_TYPE"},
@@ -363,12 +465,14 @@ def fetch_spend(session: Any, months: int, now: dt.datetime) -> SpendData:
                 break
 
         data.available = True
-        note("Cost Explorer",
-             f"Window {start} to {end} (end exclusive), MONTHLY granularity, "
-             f"UnblendedCost, {pages} request(s) at $0.01 each.")
+        if linked_account is None:
+            note("Cost Explorer",
+                 f"Window {start} to {end} (end exclusive), MONTHLY granularity, "
+                 f"UnblendedCost, {pages} request(s) at $0.01 each.")
     except Exception as err:  # noqa: BLE001 - never fail the run on spend
         data.error = explain_ce_error(err)
-        note("Cost Explorer", data.error)
+        if linked_account is None:
+            note("Cost Explorer", data.error)
 
     return data
 
@@ -812,7 +916,8 @@ def _naive(value: Any) -> Any:
 
 
 def sheet_summary(wb: Any, spend: SpendData, snapshots: List[Dict[str, Any]],
-                  account_id: str, start: str, end: str, months: int) -> None:
+                  account_id: str, start: str, end: str, months: int,
+                  org: Optional[Dict[str, Any]] = None) -> None:
     ws = wb.active
     ws.title = "Summary"
 
@@ -841,6 +946,22 @@ def sheet_summary(wb: Any, spend: SpendData, snapshots: List[Dict[str, Any]],
         ws.cell(row=row, column=1, value="Monthly average")
         ws.cell(row=row, column=2, value=round(monthly_avg, 2)).number_format = MONEY
         row += 2
+
+        if org:
+            ws.cell(row=row, column=1, value="By account").font = Font(bold=True)
+            row += 1
+            write_header(ws, row, ["Account", "Name", "Cost", "% of total"])
+            row += 1
+            for entry in org["rows"]:
+                ws.cell(row=row, column=1, value=entry["id"])
+                ws.cell(row=row, column=2, value=entry["name"])
+                ws.cell(row=row, column=3,
+                        value=round(entry["total"], 2)).number_format = MONEY
+                ws.cell(row=row, column=4,
+                        value=round(entry["total"] / (spend.total or 1.0), 4)
+                        ).number_format = '0.0%'
+                row += 1
+            row += 1
 
         ws.cell(row=row, column=1, value="By category").font = Font(bold=True)
         row += 1
@@ -898,6 +1019,43 @@ def sheet_summary(wb: Any, spend: SpendData, snapshots: List[Dict[str, Any]],
             value=round(sum(s.get("size_gib") or 0 for s in orphans), 3)).number_format = SIZE_FMT
 
     finish_sheet(ws, [46, 16, 14, 14, 14, 14, 14, 14], account_id, header_row=1)
+
+
+def sheet_by_account(wb: Any, org: Dict[str, Any], account_id: str) -> None:
+    """One row per organisation account, categories across.
+
+    Only produced when the run could list the organisation, i.e. from a
+    management account with organizations:ListAccounts.
+    """
+    ws = wb.create_sheet("By account")
+    write_header(ws, 1, ["Account", "Name"] + CATEGORIES + ["Total"])
+    row = 2
+    for entry in org["rows"]:
+        ws.cell(row=row, column=1, value=entry["id"])
+        ws.cell(row=row, column=2, value=entry["name"])
+        for i, category in enumerate(CATEGORIES, start=3):
+            cell = ws.cell(row=row, column=i,
+                           value=round(entry["categories"].get(category, 0.0), 2))
+            cell.number_format = MONEY
+        total = ws.cell(row=row, column=len(CATEGORIES) + 3,
+                        value=round(entry["total"], 2))
+        total.number_format = MONEY
+        total.font = Font(bold=True)
+        row += 1
+
+    if org["unavailable"]:
+        row += 1
+        ws.cell(row=row, column=1,
+                value="No Cost Explorer data returned for these accounts:"
+                ).font = Font(bold=True)
+        row += 1
+        for entry in org["unavailable"]:
+            ws.cell(row=row, column=1, value=entry["id"])
+            ws.cell(row=row, column=2, value=entry["name"])
+            row += 1
+
+    widths = [16, 30] + [15] * len(CATEGORIES) + [15]
+    finish_sheet(ws, widths, account_id, freeze="A2")
 
 
 def sheet_monthly_detail(wb: Any, spend: SpendData, account_id: str) -> None:
@@ -1033,8 +1191,16 @@ def sheet_rds_dynamodb(wb: Any, rds: List[Dict[str, Any]],
 
 
 def sheet_notes(wb: Any, spend: SpendData, account_id: str, regions: Sequence[str],
-                start: str, end: str, generated: dt.datetime) -> None:
+                start: str, end: str, generated: dt.datetime,
+                org: Optional[Dict[str, Any]] = None) -> None:
     ws = wb.create_sheet("Notes")
+    if org:
+        scope_label = ("Organization-wide, broken out across %d accounts "
+                       "(consolidated billing)." % len(org["rows"]))
+    else:
+        scope_label = ("Whatever this account's Cost Explorer covers. From a "
+                       "management account that is the whole organization; "
+                       "from a member account it is this account only.")
     row = 1
     ws.cell(row=row, column=1, value="Run details").font = TITLE_FONT
     row += 2
@@ -1044,6 +1210,10 @@ def sheet_notes(wb: Any, spend: SpendData, account_id: str, regions: Sequence[st
         ("Generated (UTC)", generated.strftime("%Y-%m-%d %H:%M:%S")),
         ("Regions scanned", "%d: %s" % (len(regions), ", ".join(regions))),
         ("Cost Explorer", "available" if spend.available else "UNAVAILABLE"),
+        ("Spend scope", scope_label),
+        ("Inventory scope",
+         "This account only (%s). Vaults, snapshots, RDS and DynamoDB are "
+         "per-account APIs with no consolidated view." % account_id),
     ):
         ws.cell(row=row, column=1, value=label).font = Font(bold=True)
         ws.cell(row=row, column=2, value=value).alignment = Alignment(wrap_text=True)
@@ -1124,14 +1294,17 @@ def build_workbook(path: str, spend: SpendData, vaults: List[Dict[str, Any]],
                    snapshots: List[Dict[str, Any]], rds: List[Dict[str, Any]],
                    ddb: List[Dict[str, Any]], redshift: List[Dict[str, Any]],
                    account_id: str, regions: Sequence[str], start: str, end: str,
-                   months: int, generated: dt.datetime) -> None:
+                   months: int, generated: dt.datetime,
+                   org: Optional[Dict[str, Any]] = None) -> None:
     wb = Workbook()
-    sheet_summary(wb, spend, snapshots, account_id, start, end, months)
+    sheet_summary(wb, spend, snapshots, account_id, start, end, months, org)
+    if org:
+        sheet_by_account(wb, org, account_id)
     sheet_monthly_detail(wb, spend, account_id)
     sheet_vaults(wb, vaults, account_id)
     sheet_snapshots(wb, snapshots, account_id)
     sheet_rds_dynamodb(wb, rds, ddb, redshift, account_id)
-    sheet_notes(wb, spend, account_id, regions, start, end, generated)
+    sheet_notes(wb, spend, account_id, regions, start, end, generated, org)
     wb.save(path)
 
 
@@ -1146,6 +1319,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--months", type=int, default=12,
                         help="Months of Cost Explorer history (default 12, max 12)")
     parser.add_argument("--output", help="Output .xlsx path")
+    parser.add_argument("--single-account", action="store_true",
+                        help="Skip the per-account breakdown even when run "
+                             "from a management account")
     return parser.parse_args(argv)
 
 
@@ -1179,6 +1355,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print("Reading Cost Explorer ...")
     spend = fetch_spend(session, months, generated)
 
+    org: Optional[Dict[str, Any]] = None
+    if not args.single_account and spend.available:
+        accounts = list_org_accounts(session)
+        if accounts:
+            print("Organization: %d account(s); querying Cost Explorer per "
+                  "account (%d requests, about $%.2f) ..."
+                  % (len(accounts), len(accounts), len(accounts) * 0.01))
+            per_account = fetch_spend_by_account(session, months, generated,
+                                                 accounts)
+            rows = []
+            unavailable = []
+            for account in accounts:
+                data = per_account[account["id"]]
+                if not data.available:
+                    unavailable.append(account)
+                    continue
+                rows.append({"id": account["id"], "name": account["name"],
+                             "total": data.total,
+                             "categories": data.category_totals()})
+            rows.sort(key=lambda r: r["total"], reverse=True)
+            org = {"rows": rows, "unavailable": unavailable}
+
     print("Listing enabled regions ...")
     regions = enabled_regions(session)
     print("  %d region(s)" % len(regions))
@@ -1195,12 +1393,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     redshift = scan_redshift(session, regions)
 
     build_workbook(output, spend, vaults, snapshots, rds, ddb, redshift,
-                   account_id, regions, start, end, months, generated)
+                   account_id, regions, start, end, months, generated, org)
 
     print("")
     if spend.available:
         print("Total backup spend, %s to %s: %s %s"
               % (start, end, format(spend.total, ",.2f"), spend.currency))
+        if org and org["rows"]:
+            print("Across %d accounts:" % len(org["rows"]))
+            for entry in org["rows"]:
+                print("  %-14s %-28s %s"
+                      % (entry["id"], entry["name"][:28],
+                         format(entry["total"], ",.2f")))
         totals = dict((k, v) for k, v in spend.category_totals().items() if v)
         top3 = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)[:3]
         if top3:
