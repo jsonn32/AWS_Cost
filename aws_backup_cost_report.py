@@ -415,12 +415,11 @@ def fetch_spend(session: Any, months: int, now: dt.datetime,
       try:
         discovered = discover_usage_types(ce, start, end)
         data.discovered_usage_types = len(discovered)
-        matched_preview = [u for u in discovered if classify("AWS Backup", u) or
-                           classify("EC2 - Other", u)]
         note("Cost Explorer",
-             f"Discovered {len(discovered)} usage types in the window; "
-             f"{len(matched_preview)} matched a backup pattern on a first pass. "
-             "Final attribution is per line item and is listed below.")
+             f"Discovered {len(discovered)} usage types in the window. "
+             "Which of them actually carried backup charges is the "
+             "'Usage-type patterns that matched' table above, computed from "
+             "the real line items.")
       except Exception as err:  # noqa: BLE001 - discovery is best effort
         note("Cost Explorer",
              f"Usage-type discovery failed ({err.__class__.__name__}); "
@@ -640,6 +639,7 @@ def scan_vaults(session: Any, regions: Sequence[str]) -> List[Dict[str, Any]]:
                 "warm_gib": 0.0,
                 "cold_gib": 0.0,
                 "total_gib": 0.0,
+                "size_known": False,
                 "oldest": None,
                 "newest": None,
                 "locked": "yes" if vault.get("Locked") else "no",
@@ -654,7 +654,10 @@ def scan_vaults(session: Any, regions: Sequence[str]) -> List[Dict[str, Any]]:
                         kwargs["NextToken"] = token
                     resp = client.list_recovery_points_by_backup_vault(**kwargs)
                     for rp in resp.get("RecoveryPoints", []):
-                        size = rp.get("BackupSizeInBytes") or 0
+                        raw_size = rp.get("BackupSizeInBytes")
+                        if raw_size is not None:
+                            row["size_known"] = True
+                        size = raw_size or 0
                         storage_class = (rp.get("StorageClass") or "WARM").upper()
                         if storage_class == "COLD":
                             row["cold_gib"] += size / GIB
@@ -680,9 +683,15 @@ def scan_vaults(session: Any, regions: Sequence[str]) -> List[Dict[str, Any]]:
                 note("AWS Backup",
                      "%s/%s: recovery points unreadable (%s); size left blank."
                      % (region, name, err.__class__.__name__))
-            row["warm_gib"] = round(row["warm_gib"], 3)
-            row["cold_gib"] = round(row["cold_gib"], 3)
-            row["total_gib"] = round(row["warm_gib"] + row["cold_gib"], 3)
+            if row["size_known"]:
+                row["warm_gib"] = round(row["warm_gib"], 4)
+                row["cold_gib"] = round(row["cold_gib"], 4)
+                row["total_gib"] = round(row["warm_gib"] + row["cold_gib"], 4)
+            else:
+                # No recovery point reported a size. Blank, not zero.
+                row["warm_gib"] = None
+                row["cold_gib"] = None
+                row["total_gib"] = None
             rows.append(row)
         return rows
 
@@ -997,8 +1006,11 @@ HEADER_FONT = Font(bold=True, color="FFFFFF")
 HEADER_FILL = PatternFill("solid", fgColor="44546A")
 TITLE_FONT = Font(bold=True, size=14)
 WARN_FILL = PatternFill("solid", fgColor="FCE4E4")
-MONEY = '#,##0.00'
-SIZE_FMT = '#,##0.000'
+# Two decimals normally; up to four when the amount is under a cent, so a
+# real-but-tiny charge never renders as a flat 0.
+MONEY = '#,##0.00##'
+# Same reasoning as MONEY: a few megabytes must not render as 0.000 GiB.
+SIZE_FMT = '#,##0.000##'
 
 
 def write_header(ws: Any, row: int, headers: Sequence[str]) -> None:
@@ -1066,14 +1078,20 @@ def sheet_summary(wb: Any, spend: SpendData, snapshots: List[Dict[str, Any]],
         row += 4
     else:
         ws.cell(row=row, column=1, value="Total backup spend in window").font = Font(bold=True)
-        total_cell = ws.cell(row=row, column=2, value=round(spend.total, 2))
+        total_cell = ws.cell(row=row, column=2, value=round(spend.total, 4))
         total_cell.number_format = MONEY
         total_cell.font = Font(bold=True, size=12)
         ws.cell(row=row, column=3, value=spend.currency)
         row += 1
+        if spend.total < 0.005:
+            ws.cell(row=row, column=1,
+                    value="Cost Explorer returned data, but no backup charges "
+                          "of any size in this window. Amounts under a cent "
+                          "are shown to four decimals.")
+            row += 1
         monthly_avg = spend.total / max(1, len(spend.by_month))
         ws.cell(row=row, column=1, value="Monthly average")
-        ws.cell(row=row, column=2, value=round(monthly_avg, 2)).number_format = MONEY
+        ws.cell(row=row, column=2, value=round(monthly_avg, 4)).number_format = MONEY
         row += 2
 
         if org:
@@ -1085,7 +1103,7 @@ def sheet_summary(wb: Any, spend: SpendData, snapshots: List[Dict[str, Any]],
                 ws.cell(row=row, column=1, value=entry["id"])
                 ws.cell(row=row, column=2, value=entry["name"])
                 ws.cell(row=row, column=3,
-                        value=round(entry["total"], 2)).number_format = MONEY
+                        value=round(entry["total"], 4)).number_format = MONEY
                 ws.cell(row=row, column=4,
                         value=round(entry["total"] / (spend.total or 1.0), 4)
                         ).number_format = '0.0%'
@@ -1103,7 +1121,7 @@ def sheet_summary(wb: Any, spend: SpendData, snapshots: List[Dict[str, Any]],
             if amount == 0:
                 continue
             ws.cell(row=row, column=1, value=category)
-            ws.cell(row=row, column=2, value=round(amount, 2)).number_format = MONEY
+            ws.cell(row=row, column=2, value=round(amount, 4)).number_format = MONEY
             ws.cell(row=row, column=3, value=round(amount / grand, 4)).number_format = '0.0%'
             row += 1
         row += 1
@@ -1116,10 +1134,10 @@ def sheet_summary(wb: Any, spend: SpendData, snapshots: List[Dict[str, Any]],
             cats = spend.by_month[month]
             ws.cell(row=row, column=1, value=month)
             for i, category in enumerate(CATEGORIES, start=2):
-                cell = ws.cell(row=row, column=i, value=round(cats.get(category, 0.0), 2))
+                cell = ws.cell(row=row, column=i, value=round(cats.get(category, 0.0), 4))
                 cell.number_format = MONEY
             total_cell = ws.cell(row=row, column=len(CATEGORIES) + 2,
-                                 value=round(sum(cats.values()), 2))
+                                 value=round(sum(cats.values()), 4))
             total_cell.number_format = MONEY
             total_cell.font = Font(bold=True)
             row += 1
@@ -1132,7 +1150,7 @@ def sheet_summary(wb: Any, spend: SpendData, snapshots: List[Dict[str, Any]],
         top = sorted(spend.by_usage_type.items(), key=lambda kv: kv[1], reverse=True)[:10]
         for name, amount in top:
             ws.cell(row=row, column=1, value=name)
-            ws.cell(row=row, column=2, value=round(amount, 2)).number_format = MONEY
+            ws.cell(row=row, column=2, value=round(amount, 4)).number_format = MONEY
             row += 1
         row += 1
 
@@ -1164,10 +1182,10 @@ def sheet_by_account(wb: Any, org: Dict[str, Any], account_id: str) -> None:
         ws.cell(row=row, column=2, value=entry["name"])
         for i, category in enumerate(CATEGORIES, start=3):
             cell = ws.cell(row=row, column=i,
-                           value=round(entry["categories"].get(category, 0.0), 2))
+                           value=round(entry["categories"].get(category, 0.0), 4))
             cell.number_format = MONEY
         total = ws.cell(row=row, column=len(CATEGORIES) + 3,
-                        value=round(entry["total"], 2))
+                        value=round(entry["total"], 4))
         total.number_format = MONEY
         total.font = Font(bold=True)
         row += 1
@@ -1196,7 +1214,7 @@ def sheet_monthly_detail(wb: Any, spend: SpendData, account_id: str) -> None:
         ws.cell(row=row, column=2, value=service)
         ws.cell(row=row, column=3, value=usage_type)
         ws.cell(row=row, column=4, value=category)
-        ws.cell(row=row, column=5, value=round(amount, 2)).number_format = MONEY
+        ws.cell(row=row, column=5, value=round(amount, 4)).number_format = MONEY
         row += 1
     if row == 2:
         ws.cell(row=2, column=1, value="No backup line items matched in this window.")
@@ -1215,9 +1233,12 @@ def sheet_vaults(wb: Any, vaults: List[Dict[str, Any]], account_id: str) -> None
         ws.cell(row=row, column=2, value=v["region"])
         ws.cell(row=row, column=3, value=v["vault"])
         ws.cell(row=row, column=4, value=v["recovery_points"])
-        ws.cell(row=row, column=5, value=v["warm_gib"]).number_format = SIZE_FMT
-        ws.cell(row=row, column=6, value=v["cold_gib"]).number_format = SIZE_FMT
-        ws.cell(row=row, column=7, value=v["total_gib"]).number_format = SIZE_FMT
+        for col, key in ((5, "warm_gib"), (6, "cold_gib"), (7, "total_gib")):
+            value = v.get(key)
+            cell = ws.cell(row=row, column=col,
+                           value="unknown" if value is None else value)
+            if value is not None:
+                cell.number_format = SIZE_FMT
         for col, key in ((8, "oldest"), (9, "newest")):
             cell = ws.cell(row=row, column=col, value=_naive(v.get(key)))
             cell.number_format = 'yyyy-mm-dd'
@@ -1400,7 +1421,7 @@ def sheet_notes(wb: Any, spend: SpendData, account_id: str, regions: Sequence[st
         for label, amount in sorted(spend.matched_rules.items(),
                                     key=lambda kv: kv[1], reverse=True):
             ws.cell(row=row, column=1, value=label)
-            ws.cell(row=row, column=2, value=round(amount, 2)).number_format = MONEY
+            ws.cell(row=row, column=2, value=round(amount, 4)).number_format = MONEY
             row += 1
 
     if spend.unmatched_usage_types:
@@ -1420,7 +1441,7 @@ def sheet_notes(wb: Any, spend: SpendData, account_id: str, regions: Sequence[st
                      key=lambda kv: kv[1], reverse=True)[:25]
         for name, amount in top:
             ws.cell(row=row, column=1, value=name)
-            ws.cell(row=row, column=2, value=round(amount, 2)).number_format = MONEY
+            ws.cell(row=row, column=2, value=round(amount, 4)).number_format = MONEY
             row += 1
 
     if NOTES:
